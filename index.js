@@ -7,7 +7,8 @@ const Database = require('better-sqlite3'),
   customCrypto = require("./crypto"),
   {program} = require("@caporal/core"),
   toBuffer = require('it-to-buffer'),
-  path = require("path");
+  path = require("path"),
+	{ constants } = require("fs");
 
 // Backup Each Page in Order
 const dbBackupLimiter = new Bottleneck({
@@ -43,12 +44,22 @@ class OrbitSQLite {
 
 	async backupDatabase({dbFilePath}) {
 		try {
+			console.log(`Backup Started of File: ${dbFilePath}`);
+
 			this.dbFilePath = dbFilePath;
 			this.encryptedDbFilePath = `${this.dbFilePath}-encrypted`;
 			this.dbName = path.basename(dbFilePath);
 
 			//Open Frame Map DB
 			this.backupConfigurationDatabasePath = `${this.dbFilePath}-orbit`;
+			//Check for and if needed create configuration database
+			try {
+				await fs.access(this.backupConfigurationDatabasePath, constants.R_OK | constants.W_OK);
+				console.log('Existing Backup Configuration Database Found');
+			} catch {
+				await fs.copyFile('./backupConfigurationTemplate.db-orbit', this.backupConfigurationDatabasePath);
+			}
+			//Open Configuration Database
 			this.backupConfigurationDatabase = new Database(this.backupConfigurationDatabasePath);
 
 			// Wait for the ReadStream to Initialize
@@ -67,9 +78,7 @@ class OrbitSQLite {
 			// Calculate Page Count
 			this.dbStats.pageCount = this.dbStats.size / this.dbHeader['Page Size in Bytes'];
 
-			this.db = new Database(this.dbFilePath, {
-				readonly: true
-			});
+			this.db = new Database(this.dbFilePath);
 
 			// Ensure Lock Table Exists
 			await this.#createLockTable();
@@ -131,7 +140,7 @@ class OrbitSQLite {
 					`);
 					try {
 						await newHashInsert.run({
-							name: dbName,
+							name: this.dbName,
 							fileId: 1,
 							hash: fileHash,
 							updatedOn: Date.now()
@@ -145,7 +154,7 @@ class OrbitSQLite {
 							cidVersion: 1
 						});
 
-						console.log(`Recover Database using CID: ${backupDatabaseUpload.cid.toString()}`);
+						console.log(`Recover Database using Backup Configuration Database Uploaded to CID: ${backupDatabaseUpload.cid.toString()}`);
 					} catch (err) {
 						console.error(err.message);
 					}
@@ -158,7 +167,7 @@ class OrbitSQLite {
 			this.#unlockDatabase();
 			this.db.close();
 
-			console.log(`Main Backup complete!`);
+			console.log(`Backup Completed of File: ${this.dbFilePath}`);
 		}
 	}
 
@@ -301,7 +310,6 @@ class OrbitSQLite {
 			contentToWrite = Buffer.from(encryptedContent.content);
 		}
 
-		console.log(`Uploading Page ${page.index}/${this.dbStats.pageCount} (${(100 / this.dbStats.pageCount) * page.index}) to IPFS`);
 		let uploadedPage = await this.ipfsClient.add(contentToWrite, {
 			cidVersion: 1
 		});
@@ -328,7 +336,7 @@ class OrbitSQLite {
 			console.error(err.message);
 		}
 
-		console.log(`Uploaded Page ${page.index}/${this.dbStats.pageCount} (${(100 / this.dbStats.pageCount) * page.index}) to IPFS at CID [${uploadedPage.cid.toString()}]`);
+		console.log(`Uploaded Page ${page.index}/${this.dbStats.pageCount} (${((100 / this.dbStats.pageCount) * page.index).toFixed(2)}%) to IPFS at CID [${uploadedPage.cid.toString()}]`);
 		return page;
 	}
 
@@ -367,7 +375,7 @@ class OrbitSQLite {
 		let restorationsInProgress = [];
 
 		//Worker Function to Restore Page to Decrypted Local DB File
-		let restorePage = async function (pageNumber) {
+		let restorePage = async (pageNumber) => {
 			let pageInfo = await this.preparedStatements.getPageInfo.get({
 				number: pageNumber
 			});
@@ -389,7 +397,6 @@ class OrbitSQLite {
 			restorationsInProgress.push(restorePageWorker);
 		}
 		await Promise.all(restorationsInProgress);
-		console.log(`Wrapping Up`);
 	}
 
 	#createLockTable() {
@@ -422,12 +429,12 @@ class OrbitSQLite {
 		.argument("<secretKey>", "Secret Key that Database was encrypted with")
 		.action(async ({logger, args, options}) => {
 			try {
-				logger.info("Restore Started of File: %s", args.backupConfigurationDatabasePath);
+				console.log(`Restore Started from Config ${args.backupConfigurationDatabasePath}`);
 				let db = new OrbitSQLite({
 					secretKey: args.secretKey
 				});
 				await db.restore(args.backupConfigurationDatabasePath);
-				logger.info("Restore Completed of File: %s", args.backupConfigurationDatabasePath);
+				console.log(`Restore Completed from Config ${args.backupConfigurationDatabasePath}`);
 			} catch (err) {
 				console.error(err.message);
 			}
@@ -444,8 +451,6 @@ class OrbitSQLite {
 			default: true,
 		})
 		.action(async ({logger, args, options}) => {
-			logger.info("Backup Started of File: %s", args.databaseRelativePath);
-
 			let backupSettings = {
 				dbFilePath: args.databaseRelativePath
 			}
@@ -462,13 +467,14 @@ class OrbitSQLite {
 					persistent: true
 				});
 
+
 				for await (const event of fileWatcher) {
-					logger.info(`File Event: ${event.type}`)
+					console.log(`File Event: ${event.type} - Starting Backup`)
 					let eventBackupJob = dbBackupLimiter.schedule(() => db.backupDatabase(backupSettings));
 					await eventBackupJob;
 				}
 
-				logger.info("Backup Completed of File: %s", args.databaseRelativePath);
+
 			} catch (error) {
 				console.error(error.message);
 			}
