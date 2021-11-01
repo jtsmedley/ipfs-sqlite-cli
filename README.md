@@ -1,4 +1,4 @@
-# orbit-sqlite
+# ipfs-sqlite
  CLI utility to backup and restore a SQLite database from IPFS.  Requires local instance of GO-IPFS running
 
 Arguments:
