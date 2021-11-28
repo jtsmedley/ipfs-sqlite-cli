@@ -6,7 +6,6 @@ const Database = require('better-sqlite3'),
   _ = require('lodash'),
   customCrypto = require("./crypto"),
   {program} = require("@caporal/core"),
-  toBuffer = require('it-to-buffer'),
   path = require("path"),
 	{ CID } = require('multiformats/cid'),
 	dagPB = require('@ipld/dag-pb'),
@@ -33,9 +32,7 @@ class OrbitSQLite {
 	#encryptionEnabled = true;
 	pageLinks = [];
 	successfulPageSaves = 0;
-	preparedStatements = {};
 	sectionHashes = [];
-	#spinner = undefined;
 
 	constructor({customKey, customIV, embeddedIPFS = false, unencrypted = false}) {
 		if (unencrypted === false) {
