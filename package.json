@@ -1,6 +1,6 @@
 {
-  "name": "orbit-sqlite",
-  "version": "0.0.1",
+  "name": "ipfs-sqlite-cli",
+  "version": "0.0.2",
   "description": "",
   "main": "index.js",
   "scripts": {
@@ -9,23 +9,23 @@
   "keywords": [],
   "author": "",
   "dependencies": {
-    "@caporal/core": "^2.0.2",
-    "@ipld/dag-pb": "^2.1.12",
-    "better-sqlite3": "^7.4.3",
-    "bottleneck": "^2.19.5",
-    "cids": "^1.1.9",
-    "cli-progress": "^3.9.1",
-    "crypto-random-string": "^4.0.0",
-    "fs-extra": "^10.0.0",
-    "hasha": "^5.2.2",
-    "ipfs": "^0.59.1",
-    "ipfs-unixfs": "^6.0.6",
-    "lodash": "^4.17.21",
-    "multiformats": "^9.4.8",
-    "ora": "^6.0.1"
+    "@caporal/core": "2.0.2",
+    "@ipld/dag-pb": "2.1.12",
+    "better-sqlite3": "7.4.5",
+    "bottleneck": "2.19.5",
+    "cids": "1.1.9",
+    "cli-progress": "3.9.1",
+    "crypto-random-string": "4.0.0",
+    "fs-extra": "10.0.0",
+    "hasha": "5.2.2",
+    "ipfs": "0.59.1",
+    "ipfs-http-client": "53.0.1",
+    "ipfs-unixfs": "6.0.6",
+    "lodash": "4.17.21",
+    "multiformats": "9.4.8",
+    "ora": "6.0.1"
   },
   "devDependencies": {
-    "ipfs-http-client": "^53.0.1",
-    "prettier": "^2.4.1"
+    "prettier": "2.4.1"
   }
 }
