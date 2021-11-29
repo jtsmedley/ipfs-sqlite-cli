@@ -132,6 +132,14 @@ class IPFSSQLite {
       this.dbFilePath = dbFilePath;
       this.dbName = path.basename(dbFilePath);
 
+      let keys = await this.ipfsClient.key.list();
+      this.databaseIPNSKey =
+        _.find(keys, { name: `ipfs-sqlite-db-${this.dbName}` }) ||
+        (await this.ipfsClient.key.gen(`ipfs-sqlite-db-${this.dbName}`, {
+          type: "rsa",
+          size: 2048,
+        }));
+
       this.backupState = {};
       //Get existing configuration if passed
       if (_.isString(backupStateCID)) {
@@ -149,7 +157,7 @@ class IPFSSQLite {
 
         let pageNumber = 0;
         for (let page of backupStateBlock.value.Links) {
-          this.pageLinks[pageNumber] = page;
+          this.pageLinks[pageNumber] = page.Hash;
           pageNumber++;
         }
 
@@ -279,22 +287,22 @@ class IPFSSQLite {
           }
         );
 
-        if (_.isString(backupStateCID)) {
-          if (backupStateCID !== cid.toString()) {
-            await this.ipfsClient.pin.add(cid);
-            try {
-              await this.ipfsClient.pin.rm(CID.parse(backupStateCID));
-            } catch (e) {
-              console.error(e.message);
-            }
-          } else {
-            console.log(`Backup Configuration did not change!`);
-          }
-        } else {
-          await this.ipfsClient.pin.add(cid);
-        }
+        await this.ipfsClient.pin.add(cid.toString());
 
-        console.log(`Database Backed Up to CID [${cid.toV1().toString()}]`);
+        let namePublishRequest = await this.ipfsClient.name.publish(
+          `/ipfs/${cid.toString()}`,
+          {
+            key: `ipfs-sqlite-db-${this.dbName}`,
+          }
+        );
+
+        console.log(
+          `Database Backup Published to IPNS: ${JSON.stringify(
+            namePublishRequest
+          )}`
+        );
+
+        // console.log(`Database Backed Up to CID [${cid.toV1().toString()}]`);
         return cid.toV1().toString();
       } catch (err) {
         console.error(err.message);
@@ -436,7 +444,7 @@ class IPFSSQLite {
           onlyHash: true,
         }
       );
-      if (existingHash.Hash.toString() === page.hash.cid.toString()) {
+      if (existingHash.toString() === page.hash.cid.toString()) {
         return true;
       } else {
         console.log(`Page ${page.index + 1} has changed since last backup`);
