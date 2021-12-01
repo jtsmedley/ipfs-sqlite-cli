@@ -22,7 +22,7 @@ const savePageLimiter = new Bottleneck({
   maxConcurrent: 1000,
 });
 const restorePageLimiter = new Bottleneck({
-  maxConcurrent: 1,
+  maxConcurrent: 1000,
 });
 const backupDatabaseSectionLimiter = new Bottleneck({
   maxConcurrent: 10,
@@ -31,7 +31,6 @@ const backupDatabaseSectionLimiter = new Bottleneck({
 class IPFSSQLite {
   #encryptionEnabled = true;
   pageLinks = [];
-  successfulPageSaves = 0;
   sectionHashes = [];
 
   constructor({
@@ -49,6 +48,8 @@ class IPFSSQLite {
       this.#encryptionEnabled = false;
     }
 
+    this.dbPageCIDs = [];
+    this.restoreCount = 0;
     this.IPFS = embeddedIPFS ? require("ipfs") : require("ipfs-http-client");
   }
 
@@ -233,9 +234,10 @@ class IPFSSQLite {
           continue;
         }
 
-        const sectionWorker = await backupDatabaseSectionLimiter.schedule(() =>
+        const sectionToBackup = sectionNumber;
+        const sectionWorker = backupDatabaseSectionLimiter.schedule(() =>
           this.#backupDatabaseSection(
-            sectionNumber,
+            sectionToBackup,
             sectionSize,
             pagesInSection,
             pagesChanged
@@ -289,6 +291,10 @@ class IPFSSQLite {
 
         await this.ipfsClient.pin.add(cid.toString());
 
+        console.log(
+          `Uploaded Database ${this.dbName} to IPFS at CID [${cid.toString()}]`
+        );
+
         let namePublishRequest = await this.ipfsClient.name.publish(
           `/ipfs/${cid.toString()}`,
           {
@@ -297,13 +303,10 @@ class IPFSSQLite {
         );
 
         console.log(
-          `Database Backup Published to IPNS: ${JSON.stringify(
-            namePublishRequest
-          )}`
+          `Published Database to IPNS: ${JSON.stringify(namePublishRequest)}`
         );
 
-        // console.log(`Database Backed Up to CID [${cid.toV1().toString()}]`);
-        return cid.toV1().toString();
+        return cid.toString();
       } catch (err) {
         console.error(err.message);
       }
@@ -313,10 +316,8 @@ class IPFSSQLite {
       await this.dbFileHandle.close();
 
       // Unlock Database after Backup
-      this.#unlockDatabase();
-      this.db.close();
-
-      console.log(`Backup Completed of File: ${this.dbFilePath}`);
+      await this.#unlockDatabase();
+      await this.db.close();
     }
   }
 
@@ -348,7 +349,6 @@ class IPFSSQLite {
     pagesChanged
   ) {
     try {
-      console.log(`Parsing Section ${sectionNumber}`);
       let pagesInProgress = [];
       let sectionBuffer = (
         await this.dbFileHandle.read({
@@ -394,17 +394,13 @@ class IPFSSQLite {
           (frameNumber + 1) * this.dbHeader["Page Size in Bytes"]
         );
 
-        let page = {
+        const pageToSave = {
           index: pageNumber,
           buffer: pageBuffer,
         };
 
         let savePageWorker = savePageLimiter.schedule(() => {
-          return this.#savePage(page);
-        });
-
-        savePageWorker.then((savedPage) => {
-          this.successfulPageSaves++;
+          return this.#savePage(pageToSave);
         });
 
         pagesInProgress.push(savePageWorker);
@@ -478,7 +474,31 @@ class IPFSSQLite {
     return page;
   }
 
-  async restore(backupStateCID, restorePath) {
+  async #restorePage(pageNumber, link) {
+    //Get Content
+    let contentToWrite = await this.ipfsClient.block.get(link.Hash);
+
+    //Check if Content needs Decrypted
+    if (this.#encryptionEnabled === true) {
+      contentToWrite = this.encryptionHelper.decrypt(contentToWrite);
+    }
+
+    //Write Content to Disk
+    await this.restoredDatabaseHandle.write(
+      contentToWrite,
+      0,
+      contentToWrite.byteLength,
+      pageNumber * contentToWrite.length
+    );
+
+    //Set page CID
+    this.dbPageCIDs[pageNumber] = link.Hash.toString();
+  }
+
+  async restore(
+    backupStateCID,
+    restorePath = `./restored-${this.backupState.Name}/${Date.now()}.db`
+  ) {
     console.log(`Connecting to IPFS`);
     // Wait for the IPFS Client to Initialize
     this.ipfsClient = await this.IPFS.create();
@@ -500,72 +520,126 @@ class IPFSSQLite {
     this.sectionHashes = this.backupState.Hashes.Sections;
 
     //Open Restore File
-    if (typeof restorePath === "undefined") {
-      restorePath = `./restored-${this.backupState.Name}/${Date.now()}.db`;
-    }
-
     await fse.ensureFile(restorePath);
-    this.restoredDatabaseHandle = await fs.open(restorePath, "w");
+
+    if (this.restoreCount === 0) {
+      //Open Database
+      this.restoreDB = new Database(restorePath);
+      //Lock Database
+      this.#lockDatabase(this.restoreDB, "EXCLUSIVE");
+    }
+    this.restoredDatabaseHandle = await fs.open(restorePath, "r+");
 
     //Parse through each Link and download page
     let pageNumber = 0;
+    let restoresInProgress = [];
     for (let link of backupStateBlock.value.Links) {
-      //Get Content
-      let contentToWrite = await this.ipfsClient.block.get(link.Hash);
-
-      //Check if Content needs Decrypted
-      if (this.#encryptionEnabled === true) {
-        //TODO: Get CustomIV
-        contentToWrite = this.encryptionHelper.decrypt(contentToWrite);
+      //Check current CID for page and see if page even needs changed
+      if (
+        typeof this.dbPageCIDs[pageNumber] === "string" &&
+        this.dbPageCIDs[pageNumber] === link.Hash.toString()
+      ) {
+        pageNumber++;
+        continue;
+      } else if (
+        typeof this.dbPageCIDs[pageNumber] === "string" &&
+        this.dbPageCIDs[pageNumber] !== link.Hash.toString()
+      ) {
+        console.log(`Updating Page: ${pageNumber + 1}`);
+      } else if (this.dbPageCIDs.length > 0 && this.restoreCount !== 0) {
+        console.log(`Creating Page: ${pageNumber + 1}`);
+      } else {
+        console.log(`Initializing Page: ${pageNumber + 1}`);
       }
 
-      //Write Content to Disk
-      await this.restoredDatabaseHandle.write(
-        contentToWrite,
-        0,
-        contentToWrite.byteLength,
-        pageNumber * contentToWrite.length
-      );
+      const pageToRestore = pageNumber;
+      let restorePageWorker = restorePageLimiter
+        .schedule(() => this.#restorePage(pageToRestore, link))
+        .then((restoredPage) => {
+          if (this.restoreCount === 0) {
+            console.log(
+              `Restored Page: (${pageToRestore + 1}/${
+                backupStateBlock.value.Links.length
+              }) [${(
+                (pageToRestore / backupStateBlock.value.Links.length) *
+                100
+              ).toFixed(2)}%]`
+            );
+          } else {
+            console.log(`Restored Page: ${pageToRestore + 1}`);
+          }
+        });
+
+      restoresInProgress.push(restorePageWorker);
 
       //Next page
       pageNumber++;
     }
+
+    await Promise.all(restoresInProgress);
+
+    if (this.restoreCount === 0) {
+      //Open Database
+      this.restoreDB = new Database(restorePath);
+      //Lock Database
+      this.#lockDatabase(this.restoreDB, "EXCLUSIVE");
+    }
+    this.restoreCount++;
+
+    //Close File Handle
+    await this.restoredDatabaseHandle.close();
+
+    //Clear DB Cache
+    this.restoreDB.pragma("cache_size = 0");
+    this.restoreDB.pragma("cache_size = -2000");
+
+    //Unlock Database
+    await this.#unlockDatabase(this.restoreDB);
+
+    console.log(`DB Restored`);
+
+    await this.restoreDB.close();
   }
 
   #createLockTable() {
     try {
-      this.db.prepare(`SELECT * FROM _orbit_sqlite_seq WHERE id = @id`).get({
+      this.db.prepare(`SELECT * FROM _ipfs_sqlite_seq WHERE id = @id`).get({
         id: "1",
       });
     } catch (err) {
       this.db
         .prepare(
-          `CREATE TABLE IF NOT EXISTS _orbit_sqlite_seq (id INTEGER PRIMARY KEY, seq INTEGER)`
+          `CREATE TABLE IF NOT EXISTS _ipfs_sqlite_seq (id INTEGER PRIMARY KEY, seq INTEGER)`
         )
         .run();
       this.db
         .prepare(
-          `INSERT INTO _orbit_sqlite_seq VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`
+          `INSERT INTO _ipfs_sqlite_seq VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`
         )
         .run();
     }
   }
 
-  #lockDatabase() {
+  #lockDatabase(selectedDB = this.db, lockType = null) {
     // Begin Transaction
-    this.db.prepare(`BEGIN`).run();
-    this.db.prepare(`SELECT COUNT(1) FROM _orbit_sqlite_seq`).run();
+    selectedDB.prepare(`BEGIN ${lockType || ""}`).run();
+    selectedDB.prepare(`SELECT COUNT(1) FROM _ipfs_sqlite_seq`).run();
   }
 
-  #unlockDatabase() {
+  #unlockDatabase(selectedDB = this.db) {
     // Rollback Transaction
-    return this.db.prepare(`ROLLBACK`).run();
+    return selectedDB.prepare(`ROLLBACK`).run();
   }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 (async function () {
   program
     .command("restore")
+    .option("--watch", "Watch IPNS for changes and run restore")
     .argument(
       "<backupConfigurationDatabasePath>",
       "Local Path to Backup Configuration Database"
@@ -579,11 +653,58 @@ class IPFSSQLite {
         );
         let db = new IPFSSQLite({
           embeddedIPFS: false,
-          unencrypted: args.customIv ? false : true,
+          unencrypted: !args.customIv,
           customIV: args.customIv,
           customKey: args.customKey,
         });
-        await db.restore(args.backupConfigurationDatabasePath);
+
+        db.ipfsClient = await db.IPFS.create();
+
+        let protocol = args.backupConfigurationDatabasePath.split("/")[0];
+        let backupConfigurationCID;
+        if (protocol === "ipns") {
+          backupConfigurationCID = await db.ipfsClient.name.resolve(
+            args.backupConfigurationDatabasePath.split("/")[1]
+          );
+          for await (const name of db.ipfsClient.name.resolve(
+            args.backupConfigurationDatabasePath.split("/")[1]
+          )) {
+            backupConfigurationCID = name.split("/")[2];
+          }
+        } else if (protocol === "ipfs") {
+          backupConfigurationCID =
+            args.backupConfigurationDatabasePath.split("/")[1];
+        } else {
+          throw new Error(`Invalid Protocol: ${protocol}`);
+        }
+
+        if (protocol === "ipns" && options.watch === true) {
+          let runningCID = null;
+          while (true) {
+            if (false) {
+              break;
+            }
+
+            for await (const name of db.ipfsClient.name.resolve(
+              args.backupConfigurationDatabasePath.split("/")[1],
+              {
+                nocache: true,
+              }
+            )) {
+              let currentCID = name.split("/")[2];
+
+              if (runningCID !== currentCID) {
+                await db.restore(currentCID, `replica.db`);
+                runningCID = currentCID;
+              }
+            }
+
+            await sleep(1 * 1000);
+          }
+        } else {
+          await db.restore(backupConfigurationCID);
+        }
+
         console.log(
           `Restore Completed from Config ${args.backupConfigurationDatabasePath}`
         );
@@ -631,39 +752,33 @@ class IPFSSQLite {
 
           let writeAheadLogData = await db.parseWriteAheadLog();
 
-          let dbDirWatcher = (async () => {
-            let databaseFileWatcher = await fs.watch(
-              path.dirname(db.dbFilePath),
-              {
-                persistent: true,
-              }
-            );
-
-            for await (const databaseEvent of databaseFileWatcher) {
-              console.log(
-                `Database Directory Event: ${databaseEvent.eventType}`
-              );
-
-              if (
-                path.basename(db.dbFilePath) === databaseEvent.filename &&
-                databaseEvent.eventType === "change"
-              ) {
-                console.log(`MAIN File Event: ${databaseEvent.eventType}`);
-                backupSettings.pagesChanged = writeAheadLogData.pagesAffected;
-                let eventBackupJob = dbBackupLimiter.schedule(() =>
-                  db.backupDatabase(backupSettings)
-                );
-                await eventBackupJob;
-              } else if (
-                path.basename(db.dbFilePath) + "-wal" ===
-                  databaseEvent.filename &&
-                databaseEvent.eventType === "change"
-              ) {
-                console.log(`WAL File Event: ${databaseEvent.eventType}`);
-                writeAheadLogData = await db.parseWriteAheadLog();
-              }
+          let databaseFileWatcher = await fs.watch(
+            path.dirname(db.dbFilePath),
+            {
+              persistent: true,
             }
-          })();
+          );
+
+          for await (const databaseEvent of databaseFileWatcher) {
+            if (
+              path.basename(db.dbFilePath) === databaseEvent.filename &&
+              databaseEvent.eventType === "change"
+            ) {
+              console.log(`MAIN File Event: ${databaseEvent.eventType}`);
+              backupSettings.pagesChanged = writeAheadLogData.pagesAffected;
+              let eventBackupJob = dbBackupLimiter.schedule(() =>
+                db.backupDatabase(backupSettings)
+              );
+              await eventBackupJob;
+            } else if (
+              path.basename(db.dbFilePath) + "-wal" ===
+                databaseEvent.filename &&
+              databaseEvent.eventType === "change"
+            ) {
+              console.log(`WAL File Event: ${databaseEvent.eventType}`);
+              writeAheadLogData = await db.parseWriteAheadLog();
+            }
+          }
         }
       } catch (error) {
         console.error(error.message);
