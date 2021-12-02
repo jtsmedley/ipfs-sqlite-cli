@@ -266,6 +266,12 @@ class IPFSSQLite {
           }),
         };
 
+        await this.dbFileHandle.close();
+
+        // Unlock Database after Backup
+        await this.#unlockDatabase();
+        await this.db.close();
+
         //Merge existing versions with new reference version
         backupFileSettings.data.Versions = _.uniq(
           backupFileSettings.data.Versions.concat(
@@ -295,29 +301,27 @@ class IPFSSQLite {
           `Uploaded Database ${this.dbName} to IPFS at CID [${cid.toString()}]`
         );
 
-        let namePublishRequest = await this.ipfsClient.name.publish(
-          `/ipfs/${cid.toString()}`,
-          {
-            key: `ipfs-sqlite-db-${this.dbName}`,
-          }
-        );
+        let namePublishCall = (async () => {
+          let namePublishRequest = await this.ipfsClient.name.publish(
+            `/ipfs/${cid.toString()}`,
+            {
+              key: `ipfs-sqlite-db-${this.dbName}`,
+            }
+          );
 
-        console.log(
-          `Published Database to IPNS: ${JSON.stringify(namePublishRequest)}`
-        );
+          console.log(
+            `Published Database to IPNS: ${JSON.stringify(namePublishRequest)}`
+          );
+        })();
 
         return cid.toString();
       } catch (err) {
         console.error(err.message);
+        throw err;
       }
     } catch (err) {
       console.error(err.message);
-    } finally {
-      await this.dbFileHandle.close();
-
-      // Unlock Database after Backup
-      await this.#unlockDatabase();
-      await this.db.close();
+      throw err;
     }
   }
 
@@ -406,13 +410,11 @@ class IPFSSQLite {
         pagesInProgress.push(savePageWorker);
       }
       await Promise.all(pagesInProgress);
-      try {
-        this.sectionHashes[sectionNumber] = sectionHash;
-      } catch (err) {
-        console.error(err.message);
-      }
+
+      this.sectionHashes[sectionNumber] = sectionHash;
     } catch (err) {
       console.error(err.message);
+      throw err;
     }
   }
 
@@ -458,12 +460,7 @@ class IPFSSQLite {
       }
     );
 
-    try {
-      // this.pageLinks[page.index] = new dagPB.createLink(`page-${page.index}`, contentToWrite.byteLength, uploadedPage.cid)
-      this.pageLinks[page.index] = uploadedPage.cid;
-    } catch (err) {
-      console.error(err.message);
-    }
+    this.pageLinks[page.index] = uploadedPage.cid;
 
     console.log(
       `Uploaded Page ${page.index + 1}/${this.dbStats.pageCount} (${(
@@ -519,10 +516,13 @@ class IPFSSQLite {
     );
     this.sectionHashes = this.backupState.Hashes.Sections;
 
-    //Open Restore File
+    //Ensure Restore File Exists
     await fse.ensureFile(restorePath);
 
-    if (this.restoreCount === 0) {
+    //Get Current DB Stats
+    let restoreDatabaseStats = await fs.stat(restorePath);
+
+    if (restoreDatabaseStats.size !== 0) {
       //Open Database
       this.restoreDB = new Database(restorePath);
       //Lock Database
@@ -578,7 +578,7 @@ class IPFSSQLite {
 
     await Promise.all(restoresInProgress);
 
-    if (this.restoreCount === 0) {
+    if (restoreDatabaseStats.size === 0) {
       //Open Database
       this.restoreDB = new Database(restorePath);
       //Lock Database
@@ -710,6 +710,7 @@ function sleep(ms) {
         );
       } catch (err) {
         console.error(err.message);
+        throw err;
       }
     });
 
@@ -782,6 +783,7 @@ function sleep(ms) {
         }
       } catch (error) {
         console.error(error.message);
+        throw error;
       }
     });
 
