@@ -9,8 +9,11 @@ const Database = require("better-sqlite3"),
   path = require("path"),
   { CID } = require("multiformats/cid"),
   dagPB = require("@ipld/dag-pb"),
+  dagCBOR = require("ipld-dag-cbor"),
+  dagJSON = require("@ipld/dag-json"),
   { UnixFS } = require("ipfs-unixfs"),
-  fse = require("fs-extra");
+  fse = require("fs-extra"),
+  uint8Arrays = require("uint8arrays");
 
 // Backup Each Page in Order
 const dbBackupLimiter = new Bottleneck({
@@ -32,13 +35,9 @@ class IPFSSQLite {
   #encryptionEnabled = true;
   pageLinks = [];
   sectionHashes = [];
+  function;
 
-  constructor({
-    customKey,
-    customIV,
-    embeddedIPFS = false,
-    unencrypted = false,
-  }) {
+  constructor({ customKey, customIV, unencrypted = false }) {
     if (unencrypted === false) {
       this.encryptionHelper = new customCrypto({
         customKey: customKey,
@@ -50,7 +49,7 @@ class IPFSSQLite {
 
     this.dbPageCIDs = [];
     this.restoreCount = 0;
-    this.IPFS = embeddedIPFS ? require("ipfs") : require("ipfs-http-client");
+    this.IPFS = require("ipfs-http-client");
   }
 
   async parseWriteAheadLog() {
@@ -164,7 +163,6 @@ class IPFSSQLite {
 
         //Add current version to history
         this.backupState.Versions.push({
-          CreatedOn: this.backupState.CreatedOn,
           cid: backupStateCID,
         });
       }
@@ -172,7 +170,7 @@ class IPFSSQLite {
       console.log(`Opening Database File: ${this.dbFilePath}`);
       // Open Database in WAL mode
       this.db = new Database(this.dbFilePath);
-      this.db.pragma("journal_mode = WAL");
+      this.db.pragma("journal_mode = MEMORY");
       // Wait for the ReadStream to Initialize
       this.dbFileHandle = await fs.open(this.dbFilePath, "r");
       // Parse DB Header
@@ -250,40 +248,18 @@ class IPFSSQLite {
 
       await this.dbFileHandle.close();
       try {
+        // Unlock Database after Backup
+        await this.dbFileHandle.close();
+        await this.#unlockDatabase();
+        await this.db.close();
+
         let backupFileSettings = {
           type: "file",
-          data: {
-            Name: this.dbName,
-            Hashes: {
-              File: fileHash,
-              Sections: this.sectionHashes,
-            },
-            Versions: [],
-            CreatedOn: Date.now(),
-          },
           blockSizes: this.pageLinks.map(() => {
             return this.dbHeader["Page Size in Bytes"];
           }),
         };
-
-        await this.dbFileHandle.close();
-
-        // Unlock Database after Backup
-        await this.#unlockDatabase();
-        await this.db.close();
-
-        //Merge existing versions with new reference version
-        backupFileSettings.data.Versions = _.uniq(
-          backupFileSettings.data.Versions.concat(
-            this.backupState.Versions || []
-          )
-        );
-        backupFileSettings.data = Buffer.from(
-          JSON.stringify(backupFileSettings.data)
-        );
-
         this.backupFile = new UnixFS(backupFileSettings);
-
         const cid = await this.ipfsClient.dag.put(
           dagPB.prepare({
             Data: this.backupFile.marshal(),
@@ -294,21 +270,47 @@ class IPFSSQLite {
             hashAlg: "sha2-256",
           }
         );
-
         await this.ipfsClient.pin.add(cid.toString());
 
+        const currentTime = Date.now();
+        let backupMetadataSettings = {
+          Name: this.dbName,
+          Hashes: {
+            File: fileHash,
+            Sections: this.sectionHashes,
+          },
+          Versions: {
+            Current: cid,
+            [currentTime]: cid,
+          },
+        };
+        // Merge existing versions with new reference version
+        backupMetadataSettings.Versions = _.merge(
+          backupMetadataSettings.Versions,
+          this.backupState.Versions || {}
+        );
+        const metadataCID = await this.ipfsClient.dag.put(
+          backupMetadataSettings,
+          {
+            format: "dag-cbor",
+            hashAlg: "sha2-256",
+          }
+        );
+        await this.ipfsClient.pin.add(metadataCID.toString());
         console.log(
           `Uploaded Database ${this.dbName} to IPFS at CID [${cid.toString()}]`
+        );
+        console.log(
+          `Uploaded Metadata to IPFS at CID [${metadataCID.toString()}]`
         );
 
         let namePublishCall = (async () => {
           let namePublishRequest = await this.ipfsClient.name.publish(
-            `/ipfs/${cid.toString()}`,
+            `/ipfs/${metadataCID.toString()}`,
             {
               key: `ipfs-sqlite-db-${this.dbName}`,
             }
           );
-
           console.log(
             `Published Database to IPNS: ${JSON.stringify(namePublishRequest)}`
           );
@@ -492,10 +494,7 @@ class IPFSSQLite {
     this.dbPageCIDs[pageNumber] = link.Hash.toString();
   }
 
-  async restore(
-    backupStateCID,
-    restorePath = `./restored-${this.backupState.Name}/${Date.now()}.db`
-  ) {
+  async restore(backupStateCID, restorePath) {
     console.log(`Connecting to IPFS`);
     // Wait for the IPFS Client to Initialize
     this.ipfsClient = await this.IPFS.create();
@@ -514,6 +513,11 @@ class IPFSSQLite {
     this.backupState = JSON.parse(
       new TextDecoder().decode(this.backupFileInfo.data)
     );
+
+    if (typeof restorePath === "undefined") {
+      restorePath = `./restored-${this.backupState.Name}/${Date.now()}.db`;
+    }
+
     this.sectionHashes = this.backupState.Hashes.Sections;
 
     //Ensure Restore File Exists
@@ -533,6 +537,9 @@ class IPFSSQLite {
     //Parse through each Link and download page
     let pageNumber = 0;
     let restoresInProgress = [];
+
+    //Determine which sections can be skipped
+
     for (let link of backupStateBlock.value.Links) {
       //Check current CID for page and see if page even needs changed
       if (
@@ -561,7 +568,7 @@ class IPFSSQLite {
               `Restored Page: (${pageToRestore + 1}/${
                 backupStateBlock.value.Links.length
               }) [${(
-                (pageToRestore / backupStateBlock.value.Links.length) *
+                ((pageToRestore + 1) / backupStateBlock.value.Links.length) *
                 100
               ).toFixed(2)}%]`
             );
@@ -632,7 +639,7 @@ class IPFSSQLite {
   }
 }
 
-function sleep(ms) {
+async function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
@@ -652,7 +659,6 @@ function sleep(ms) {
           `Restore Started from Config ${args.backupConfigurationDatabasePath}`
         );
         let db = new IPFSSQLite({
-          embeddedIPFS: false,
           unencrypted: !args.customIv,
           customIV: args.customIv,
           customKey: args.customKey,
@@ -663,11 +669,8 @@ function sleep(ms) {
         let protocol = args.backupConfigurationDatabasePath.split("/")[0];
         let backupConfigurationCID;
         if (protocol === "ipns") {
-          backupConfigurationCID = await db.ipfsClient.name.resolve(
-            args.backupConfigurationDatabasePath.split("/")[1]
-          );
           for await (const name of db.ipfsClient.name.resolve(
-            args.backupConfigurationDatabasePath.split("/")[1]
+            args.backupConfigurationDatabasePath
           )) {
             backupConfigurationCID = name.split("/")[2];
           }
@@ -735,7 +738,6 @@ function sleep(ms) {
       };
 
       let db = new IPFSSQLite({
-        embeddedIPFS: false,
         unencrypted: options.unencrypted,
         customIV: args.customIv,
         customKey: args.customKey,
