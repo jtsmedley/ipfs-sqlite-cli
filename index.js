@@ -9,11 +9,8 @@ const Database = require("better-sqlite3"),
   path = require("path"),
   { CID } = require("multiformats/cid"),
   dagPB = require("@ipld/dag-pb"),
-  dagCBOR = require("ipld-dag-cbor"),
-  dagJSON = require("@ipld/dag-json"),
   { UnixFS } = require("ipfs-unixfs"),
-  fse = require("fs-extra"),
-  uint8Arrays = require("uint8arrays");
+  fse = require("fs-extra");
 
 // Backup Each Page in Order
 const dbBackupLimiter = new Bottleneck({
@@ -35,7 +32,6 @@ class IPFSSQLite {
   #encryptionEnabled = true;
   pageLinks = [];
   sectionHashes = [];
-  function;
 
   constructor({ customKey, customIV, unencrypted = false }) {
     if (unencrypted === false) {
@@ -133,12 +129,19 @@ class IPFSSQLite {
       this.dbName = path.basename(dbFilePath);
 
       let keys = await this.ipfsClient.key.list();
-      this.databaseIPNSKey =
-        _.find(keys, { name: `ipfs-sqlite-db-${this.dbName}` }) ||
-        (await this.ipfsClient.key.gen(`ipfs-sqlite-db-${this.dbName}`, {
-          type: "rsa",
-          size: 2048,
-        }));
+      this.databaseIPNSKey = _.find(keys, {
+        name: `ipfs-sqlite-db-${this.dbName}`,
+      });
+
+      if (typeof this.databaseIPNSKey === "undefined") {
+        this.databaseIPNSKey = await this.ipfsClient.key.gen(
+          `ipfs-sqlite-db-${this.dbName}`,
+          {
+            type: "rsa",
+            size: 2048,
+          }
+        );
+      }
 
       this.backupState = {};
       //Get existing configuration if passed
@@ -316,7 +319,10 @@ class IPFSSQLite {
           );
         })();
 
-        return cid.toString();
+        return {
+          publishRequest: namePublishCall,
+          CID: cid.toString(),
+        };
       } catch (err) {
         console.error(err.message);
         throw err;
@@ -477,7 +483,7 @@ class IPFSSQLite {
     //Get Content
     let contentToWrite = await this.ipfsClient.block.get(link.Hash);
 
-    //Check if Content needs Decrypted
+    //Check if Content is encrypted
     if (this.#encryptionEnabled === true) {
       contentToWrite = this.encryptionHelper.decrypt(contentToWrite);
     }
@@ -541,7 +547,7 @@ class IPFSSQLite {
     //Determine which sections can be skipped
 
     for (let link of backupStateBlock.value.Links) {
-      //Check current CID for page and see if page even needs changed
+      //Check current CID for page and see if page has changed
       if (
         typeof this.dbPageCIDs[pageNumber] === "string" &&
         this.dbPageCIDs[pageNumber] === link.Hash.toString()
@@ -553,10 +559,8 @@ class IPFSSQLite {
         this.dbPageCIDs[pageNumber] !== link.Hash.toString()
       ) {
         console.log(`Updating Page: ${pageNumber + 1}`);
-      } else if (this.dbPageCIDs.length > 0 && this.restoreCount !== 0) {
-        console.log(`Creating Page: ${pageNumber + 1}`);
       } else {
-        console.log(`Initializing Page: ${pageNumber + 1}`);
+        console.log(`Creating Page: ${pageNumber + 1}`);
       }
 
       const pageToRestore = pageNumber;
@@ -572,9 +576,10 @@ class IPFSSQLite {
                 100
               ).toFixed(2)}%]`
             );
-          } else {
-            console.log(`Restored Page: ${pageToRestore + 1}`);
+            return;
           }
+
+          console.log(`Restored Page: ${pageToRestore + 1}`);
         });
 
       restoresInProgress.push(restorePageWorker);
@@ -667,6 +672,7 @@ async function sleep(ms) {
         db.ipfsClient = await db.IPFS.create();
 
         let protocol = args.backupConfigurationDatabasePath.split("/")[0];
+
         let backupConfigurationCID;
         if (protocol === "ipns") {
           for await (const name of db.ipfsClient.name.resolve(
@@ -681,36 +687,38 @@ async function sleep(ms) {
           throw new Error(`Invalid Protocol: ${protocol}`);
         }
 
-        if (protocol === "ipns" && options.watch === true) {
-          let runningCID = null;
-          while (true) {
-            if (false) {
-              break;
-            }
-
-            for await (const name of db.ipfsClient.name.resolve(
-              args.backupConfigurationDatabasePath.split("/")[1],
-              {
-                nocache: true,
-              }
-            )) {
-              let currentCID = name.split("/")[2];
-
-              if (runningCID !== currentCID) {
-                await db.restore(currentCID, `replica.db`);
-                runningCID = currentCID;
-              }
-            }
-
-            await sleep(1 * 1000);
-          }
-        } else {
+        if (options.watch !== true) {
           await db.restore(backupConfigurationCID);
+
+          console.log(
+            `Restore Completed from Config ${args.backupConfigurationDatabasePath}`
+          );
         }
 
-        console.log(
-          `Restore Completed from Config ${args.backupConfigurationDatabasePath}`
-        );
+        if (protocol !== "ipns") {
+          throw new Error(`Must use an IPNS path for replication`);
+        }
+
+        let runningCID = null;
+        while (options.watch === true) {
+          for await (const name of db.ipfsClient.name.resolve(
+            args.backupConfigurationDatabasePath.split("/")[1],
+            {
+              nocache: true,
+            }
+          )) {
+            let currentCID = name.split("/")[2];
+
+            if (runningCID === currentCID) {
+              continue;
+            }
+
+            await db.restore(currentCID, `replica.db`);
+            runningCID = currentCID;
+          }
+
+          await sleep(1000);
+        }
       } catch (err) {
         console.error(err.message);
         throw err;
@@ -744,10 +752,10 @@ async function sleep(ms) {
       });
 
       try {
-        let backupJob = dbBackupLimiter.schedule(
-          () =>
-            (backupSettings.backupStateCID = db.backupDatabase(backupSettings))
-        );
+        let backupJob = dbBackupLimiter.schedule(() => {
+          let backupRequest = db.backupDatabase(backupSettings);
+          backupSettings.backupStateCID = backupRequest.CID;
+        });
         await backupJob;
 
         if (options.watch === true) {
