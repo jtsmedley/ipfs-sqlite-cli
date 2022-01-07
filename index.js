@@ -7,9 +7,6 @@ const Database = require("better-sqlite3"),
   customCrypto = require("./crypto"),
   { program } = require("@caporal/core"),
   path = require("path"),
-  { CID } = require("multiformats/cid"),
-  dagPB = require("@ipld/dag-pb"),
-  { UnixFS } = require("ipfs-unixfs"),
   fse = require("fs-extra");
 
 // Backup Each Page in Order
@@ -28,11 +25,18 @@ const backupDatabaseSectionLimiter = new Bottleneck({
   maxConcurrent: 10,
 });
 
+const adapters = {
+  IPFS: require("./adapters/ipfsAdapter"),
+};
+
+let selectedAdapter = null;
+
 class IPFSSQLite {
   #configuration = {
     encryptionEnabled: true,
   };
-  #runningMetadata = {
+  #runningMetadata = {};
+  #runningBackup = {
     pageLinks: [],
     sectionHashes: [],
   };
@@ -47,43 +51,33 @@ class IPFSSQLite {
       this.#configuration.encryptionEnabled = false;
     }
 
+    this.selectedAdapter = new adapters.IPFS({
+      databaseName: `test.db`,
+    });
+
     this.dbPageCIDs = [];
     this.restoreCount = 0;
-    this.IPFS = require("ipfs-http-client");
   }
 
-  async restore(backupStateCID, restorePath) {
+  async restoreDatabase({ backupStateCID, restorePath }) {
     console.log(`Connecting to IPFS`);
-    // Wait for the IPFS Client to Initialize
-    this.ipfsClient = await this.IPFS.create();
 
-    this.backupState = {};
     //Get existing configuration if passed
     if (_.isString(backupStateCID) === false) {
       throw new Error(`Invalid CID`);
     }
 
-    console.log(`Fetching Existing Backup State from CID: ${backupStateCID}`);
-    let backupStateBlock = await this.ipfsClient.dag.get(
-      CID.parse(backupStateCID)
-    );
-    this.backupFileInfo = UnixFS.unmarshal(backupStateBlock.value.Data);
-    this.backupState = JSON.parse(
-      new TextDecoder().decode(this.backupFileInfo.data)
-    );
+    this.backupState = this.selectedAdapter.getMetadata(backupStateCID);
+    this.#runningBackup.sectionHashes = this.backupState.Hashes.Sections;
 
     if (typeof restorePath === "undefined") {
       restorePath = `./restored-${this.backupState.Name}/${Date.now()}.db`;
     }
-
-    this.#runningMetadata.sectionHashes = this.backupState.Hashes.Sections;
-
     //Ensure Restore File Exists
     await fse.ensureFile(restorePath);
-
     //Get Current DB Stats
     let restoreDatabaseStats = await fs.stat(restorePath);
-
+    //Check if Initial Restore
     if (restoreDatabaseStats.size !== 0) {
       //Open Database
       this.restoreDB = new Database(restorePath);
@@ -92,12 +86,10 @@ class IPFSSQLite {
     }
     this.restoredDatabaseHandle = await fs.open(restorePath, "r+");
 
-    //Parse through each Link and download page
+    //Parse through each Link and Download Pages
     let pageNumber = 0;
     let restoresInProgress = [];
-
     //Determine which sections can be skipped
-
     for (let link of backupStateBlock.value.Links) {
       //Check current CID for page and see if page has changed
       if (
@@ -116,30 +108,34 @@ class IPFSSQLite {
       }
 
       const pageToRestore = pageNumber;
-      let restorePageWorker = restorePageLimiter
-        .schedule(() => this.#restorePage(pageToRestore, link))
-        .then((restoredPage) => {
-          if (this.restoreCount === 0) {
-            console.log(
-              `Restored Page: (${pageToRestore + 1}/${
-                backupStateBlock.value.Links.length
-              }) [${(
-                ((pageToRestore + 1) / backupStateBlock.value.Links.length) *
-                100
-              ).toFixed(2)}%]`
-            );
-            return;
-          }
 
-          console.log(`Restored Page: ${pageToRestore + 1}`);
-        });
+      //Write Content to Disk
+      let contentToWrite = await this.selectedAdapter.restorePage(
+        pageToRestore,
+        link
+      );
+      await this.restoredDatabaseHandle.write(
+        contentToWrite,
+        0,
+        contentToWrite.byteLength,
+        pageNumber * contentToWrite.length
+      );
 
-      restoresInProgress.push(restorePageWorker);
+      //Set page CID
+      this.dbPageCIDs[pageNumber] = link.Hash.toString();
+
+      console.log(
+        `Restored Page: (${pageToRestore + 1}/${
+          backupStateBlock.value.Links.length
+        }) [${(
+          ((pageToRestore + 1) / backupStateBlock.value.Links.length) *
+          100
+        ).toFixed(2)}%]`
+      );
 
       //Next page
       pageNumber++;
     }
-
     await Promise.all(restoresInProgress);
 
     if (restoreDatabaseStats.size === 0) {
@@ -157,231 +153,185 @@ class IPFSSQLite {
     this.restoreDB.pragma("cache_size = 0");
     this.restoreDB.pragma("cache_size = -2000");
 
-    //Unlock Database
+    //Unlock and Close Database
     await this.#unlockDatabase(this.restoreDB);
+    await this.restoreDB.close();
 
     console.log(`DB Restored`);
-
-    await this.restoreDB.close();
   }
 
   async backupDatabase({ dbFilePath, backupStateCID, pagesChanged }) {
-    try {
-      console.log(`Connecting to IPFS`);
-      // Wait for the IPFS Client to Initialize
-      this.ipfsClient = await this.ipfsClient;
-      console.log(`Starting Backup of File: ${dbFilePath}`);
-      this.ipfsClient = await this.IPFS.create();
+    console.log(`Starting Backup of File: ${dbFilePath}`);
 
-      this.dbFilePath = dbFilePath;
-      this.dbName = path.basename(dbFilePath);
+    //Connect with Selected Adapter
+    console.log(`Connecting to Selected Adapter`);
+    await this.selectedAdapter.connect({});
+    this.dbFilePath = dbFilePath;
+    this.dbName = path.basename(dbFilePath);
 
-      let keys = await this.ipfsClient.key.list();
-      this.databaseIPNSKey = _.find(keys, {
-        name: `ipfs-sqlite-db-${this.dbName}`,
-      });
+    this.backupState = {};
 
-      if (typeof this.databaseIPNSKey === "undefined") {
-        this.databaseIPNSKey = await this.ipfsClient.key.gen(
-          `ipfs-sqlite-db-${this.dbName}`,
-          {
-            type: "rsa",
-            size: 2048,
-          }
-        );
+    //Get existing configuration if passed
+    if (_.isString(backupStateCID)) {
+      console.log(`Fetching Existing Backup State`);
+      this.backupState = await this.selectedAdapter.getMetadata(backupStateCID);
+
+      //Load existing section hashes
+      this.#runningBackup.sectionHashes = this.backupState.Hashes.Sections;
+
+      //Load existing page references
+      let pageNumber = 0;
+      for (let page of this.backupState.value.Links) {
+        this.#runningBackup.pageLinks[pageNumber] = page.Hash;
+        pageNumber++;
       }
-
-      this.backupState = {};
-      //Get existing configuration if passed
-      if (_.isString(backupStateCID)) {
-        console.log(
-          `Fetching Existing Backup State from CID: ${backupStateCID}`
-        );
-        let backupStateBlock = await this.ipfsClient.dag.get(
-          CID.parse(backupStateCID)
-        );
-        this.backupFileInfo = UnixFS.unmarshal(backupStateBlock.value.Data);
-        this.backupState = JSON.parse(
-          new TextDecoder().decode(this.backupFileInfo.data)
-        );
-        this.#runningMetadata.sectionHashes = this.backupState.Hashes.Sections;
-
-        let pageNumber = 0;
-        for (let page of backupStateBlock.value.Links) {
-          this.#runningMetadata.pageLinks[pageNumber] = page.Hash;
-          pageNumber++;
-        }
-
-        //Add current version to history
-        this.backupState.Versions.push({
-          cid: backupStateCID,
-        });
-      }
-
-      console.log(`Opening Database File: ${this.dbFilePath}`);
-      // Open Database in WAL mode
-      this.db = new Database(this.dbFilePath);
-      this.db.pragma("journal_mode = MEMORY");
-      // Wait for the ReadStream to Initialize
-      this.dbFileHandle = await fs.open(this.dbFilePath, "r");
-      // Parse DB Header
-      this.dbHeader = await this.#parseHeader();
-      // Fetch Database File Stats
-      this.dbStats = await this.dbFileHandle.stat();
-      // Calculate Page Count
-      this.dbStats.pageCount =
-        this.dbStats.size / this.dbHeader["Page Size in Bytes"];
-      // Ensure Lock Table Exists
-      this.#createLockTable(this.db);
-      // Lock Database for Backup
-      this.#lockDatabase(this.db);
-
-      console.log(`Generating Hash of Database File: ${dbFilePath}`);
-      let fileHash = await hasha.fromFile(this.dbFilePath, {
-        encoding: "hex",
-        algorithm: "sha256",
-      });
-
-      // Return true immediately if values match
-      if (
-        typeof pagesChanged === "undefined" &&
-        _.isString(this.backupState?.Hashes?.File) &&
-        this.backupState.Hashes.File === fileHash
-      ) {
-        console.log(
-          `No changes detected since last sync for database file: ${this.dbFilePath}`
-        );
-        return;
-      }
-      console.log(`File ${this.dbFilePath} has changed since last backup`);
-
-      let maxSectionSize = 1000 * this.dbHeader["Page Size in Bytes"]; // 1000 Pages of Database
-      let pagesInSection = Math.floor(
-        maxSectionSize / this.dbHeader["Page Size in Bytes"]
-      );
-      let sectionSize = pagesInSection * this.dbHeader["Page Size in Bytes"];
-      let sectionCount = Math.ceil(this.dbStats.size / sectionSize);
-
-      let sectionsChanged = new Set();
-      if (typeof pagesChanged !== "undefined" && pagesChanged.length > 0) {
-        pagesChanged.forEach((page) => {
-          sectionsChanged.add(page % sectionSize);
-        });
-      }
-
-      let sectionsInProgress = [];
-      for (
-        let sectionNumber = 0;
-        sectionNumber < sectionCount;
-        sectionNumber++
-      ) {
-        //Skip sections that haven't been changed
-        if (
-          sectionsChanged.length > 0 &&
-          sectionsChanged.has(sectionNumber) === false
-        ) {
-          continue;
-        }
-
-        const sectionToBackup = sectionNumber;
-        const sectionWorker = backupDatabaseSectionLimiter.schedule(() =>
-          this.#checkSectionForChanges(
-            sectionToBackup,
-            sectionSize,
-            pagesInSection,
-            pagesChanged
-          )
-        );
-
-        sectionsInProgress.push(sectionWorker);
-      }
-      await Promise.all(sectionsInProgress);
-
-      await this.dbFileHandle.close();
-      try {
-        // Unlock Database after Backup
-        await this.dbFileHandle.close();
-        await this.#unlockDatabase();
-        await this.db.close();
-
-        let backupFileSettings = {
-          type: "file",
-          blockSizes: this.#runningMetadata.pageLinks.map(() => {
-            return this.dbHeader["Page Size in Bytes"];
-          }),
-        };
-        this.backupFile = new UnixFS(backupFileSettings);
-        const cid = await this.ipfsClient.dag.put(
-          dagPB.prepare({
-            Data: this.backupFile.marshal(),
-            Links: this.#runningMetadata.pageLinks,
-          }),
-          {
-            format: "dag-pb",
-            hashAlg: "sha2-256",
-          }
-        );
-        await this.ipfsClient.pin.add(cid.toString());
-
-        const currentTime = Date.now();
-        let backupMetadataSettings = {
-          Name: this.dbName,
-          Hashes: {
-            File: fileHash,
-            Sections: this.#runningMetadata.sectionHashes,
-          },
-          Versions: {
-            Current: cid,
-            [currentTime]: cid,
-          },
-        };
-        // Merge existing versions with new reference version
-        backupMetadataSettings.Versions = _.merge(
-          backupMetadataSettings.Versions,
-          this.backupState.Versions || {}
-        );
-        const metadataCID = await this.ipfsClient.dag.put(
-          backupMetadataSettings,
-          {
-            format: "dag-cbor",
-            hashAlg: "sha2-256",
-          }
-        );
-        await this.ipfsClient.pin.add(metadataCID.toString());
-        console.log(
-          `Uploaded Database ${this.dbName} to IPFS at CID [${cid.toString()}]`
-        );
-        console.log(
-          `Uploaded Metadata to IPFS at CID [${metadataCID.toString()}]`
-        );
-
-        let namePublishCall = (async () => {
-          let namePublishRequest = await this.ipfsClient.name.publish(
-            `/ipfs/${metadataCID.toString()}`,
-            {
-              key: `ipfs-sqlite-db-${this.dbName}`,
-            }
-          );
-          console.log(
-            `Published Database to IPNS: ${JSON.stringify(namePublishRequest)}`
-          );
-        })();
-
-        return {
-          publishRequest: namePublishCall,
-          CID: cid.toString(),
-        };
-      } catch (err) {
-        console.error(err.message);
-        throw err;
-      }
-    } catch (err) {
-      console.error(err.message);
-      throw err;
     }
+
+    // Open Database in WAL mode
+    console.log(`Opening Database File`);
+    this.db = new Database(this.dbFilePath);
+    this.db.pragma("journal_mode = MEMORY");
+    // Ensure Lock Table Exists
+    this.#createLockTable(this.db);
+    // Lock Database for Backup
+    this.#lockDatabase(this.db);
+
+    // Wait for the ReadStream to Initialize
+    this.dbFileHandle = await fs.open(this.dbFilePath, "r");
+    // Parse DB Header
+    this.dbHeader = await this.#parseDatabaseHeader();
+    // Fetch Database File Stats
+    this.dbStats = await this.dbFileHandle.stat();
+    // Calculate Page Count
+    this.dbStats.pageCount =
+      this.dbStats.size / this.dbHeader["Page Size in Bytes"];
+
+    //Generate Hash of Current Database File
+    console.log(`Generating Hash of Database File: ${dbFilePath}`);
+    let fileHash = await hasha.fromFile(this.dbFilePath, {
+      encoding: "hex",
+      algorithm: "sha256",
+    });
+
+    // Return true immediately if values match and no pages have been marked as changed
+    if (
+      _.isString(this.backupState?.Hashes?.File) &&
+      this.backupState.Hashes.File === fileHash
+    ) {
+      console.log(
+        `No changes detected since last sync for database file: ${this.dbFilePath}`
+      );
+      return;
+    }
+    console.log(`File ${this.dbFilePath} has changed since last backup`);
+
+    let maxSectionSize = 1000 * this.dbHeader["Page Size in Bytes"]; // 1000 Pages of Database
+    let pagesInSection =
+      maxSectionSize > this.dbStats.pageCount
+        ? this.dbStats.pageCount
+        : maxSectionSize;
+    let sectionSize = pagesInSection * this.dbHeader["Page Size in Bytes"];
+    let sectionCount = Math.ceil(this.dbStats.size / sectionSize);
+
+    let sectionsChanged = new Set();
+    let pagesChangedBySection = {};
+    if (typeof pagesChanged !== "undefined") {
+      for (let pageNumber of pagesChanged) {
+        let sectionNumber = pageNumber % sectionSize;
+        sectionsChanged.add(sectionNumber);
+        pagesChangedBySection[sectionNumber] =
+          pagesChangedBySection[sectionNumber] || new Set();
+        pagesChangedBySection[sectionNumber].add(pageNumber);
+      }
+    }
+
+    let sectionsInProgress = [];
+    for (let sectionNumber = 0; sectionNumber < sectionCount; sectionNumber++) {
+      //Skip sections that haven't been changed
+      if (
+        sectionsChanged.length > 0 &&
+        sectionsChanged.has(sectionNumber) === false
+      ) {
+        continue;
+      }
+
+      //Get Buffer for Section
+      let sectionBuffer = (
+        await this.dbFileHandle.read({
+          buffer: Buffer.alloc(sectionSize),
+          offset: 0,
+          length: sectionSize,
+          position: sectionNumber * sectionSize,
+        })
+      ).buffer;
+
+      let pagesChangedInSection = pagesChangedBySection[sectionNumber] || [];
+
+      if (typeof pagesChangedBySection[sectionNumber] === "undefined") {
+        let sectionInfo = await this.#checkSectionForChanges(
+          sectionBuffer,
+          sectionNumber,
+          sectionSize,
+          pagesInSection
+        );
+
+        pagesChangedInSection = sectionInfo.changedPages;
+      }
+
+      let pagesInProgress = [];
+      // Check each page for changes
+      for (let pageNumber of pagesChangedInSection) {
+        let savePageWorker = savePageLimiter.schedule(() => {
+          return this.selectedAdapter.savePage(
+            pageNumber,
+            sectionBuffer.subarray(
+              pageNumber * this.dbHeader["Page Size in Bytes"],
+              (pageNumber + 1) * this.dbHeader["Page Size in Bytes"]
+            ),
+            this.#configuration.encryptionEnabled
+          );
+        });
+
+        savePageWorker.then((saveResult) => {
+          let savedPageID = saveResult.id;
+          console.log(saveResult.message);
+          this.#runningBackup.pageLinks[pageNumber] = savedPageID;
+        });
+
+        pagesInProgress.push(savePageWorker);
+      }
+
+      // Wait for All Pages to Finish Backing Up
+      await Promise.all(pagesInProgress);
+    }
+    // Wait for All Sections to Finish Backing Up
+    await Promise.all(sectionsInProgress);
+
+    // Unlock and Close Database after Backup
+    await this.#unlockDatabase();
+    await this.db.close();
+
+    // Close File Handle after Backup
+    await this.dbFileHandle.close();
+
+    let backupCID = await this.selectedAdapter.saveBackup(
+      this.#runningBackup.pageLinks,
+      this.dbHeader["Page Size in Bytes"]
+    );
+
+    let metadataResult = await this.selectedAdapter.saveMetadata(
+      fileHash,
+      this.#runningBackup.sectionHashes,
+      backupCID.toString()
+    );
+
+    let publishRequest = await this.selectedAdapter.publishMetadata(
+      `/ipfs/${metadataResult.Link}`
+    );
+    console.log(publishRequest.message);
   }
 
-  async trackLogChanges() {
+  async watchPageChanges() {
     try {
       this.dbWALHandle = await fs.open(`${this.dbFilePath}-wal`, "r");
     } catch {
@@ -450,7 +400,7 @@ class IPFSSQLite {
     };
   }
 
-  async #parseHeader() {
+  async #parseDatabaseHeader() {
     let headerBuffer = (
       await this.dbFileHandle.read(Buffer.alloc(100), 0, 100, 0)
     ).buffer;
@@ -472,139 +422,63 @@ class IPFSSQLite {
   }
 
   async #checkSectionForChanges(
+    sectionBuffer,
     sectionNumber,
     sectionSize,
-    pagesInSection,
-    pagesChanged
+    pagesInSection
   ) {
     try {
-      let pagesInProgress = [];
-      let sectionBuffer = (
-        await this.dbFileHandle.read({
-          buffer: Buffer.alloc(sectionSize),
-          offset: 0,
-          length: sectionSize,
-          position: sectionNumber * sectionSize,
-        })
-      ).buffer;
-
+      //Get Hash for Section
       let sectionHash = await hasha.async(sectionBuffer, {
         encoding: "hex",
         algorithm: "sha256",
       });
 
+      //Load Existing Section Hashes
       let existingHash = undefined;
       if (_.isArray(this.backupState?.Hashes?.Sections)) {
         existingHash = this.backupState.Hashes.Sections[sectionNumber];
-      }
 
-      // Return true immediately if values match
-      if (_.isString(existingHash) && existingHash === sectionHash) {
-        console.log(
-          `Section ${sectionNumber} has not changed since last backup`
-        );
-        return;
-      }
-
-      for (
-        let frameNumber = 0, pageNumber = sectionNumber * pagesInSection;
-        frameNumber < pagesInSection && pageNumber < this.dbStats.pageCount;
-        frameNumber++, pageNumber++
-      ) {
-        if (
-          typeof pagesChanged === "object" &&
-          pagesChanged.has(pageNumber + 1) === false
-        ) {
-          continue;
+        // Return true immediately if section has not changed
+        if (_.isString(existingHash) && existingHash === sectionHash) {
+          console.log(
+            `Section ${sectionNumber} has not changed since last backup`
+          );
+          return sectionHash;
         }
-
-        let pageBuffer = sectionBuffer.subarray(
-          frameNumber * this.dbHeader["Page Size in Bytes"],
-          (frameNumber + 1) * this.dbHeader["Page Size in Bytes"]
-        );
-
-        const pageToSave = {
-          index: pageNumber,
-          buffer: pageBuffer,
-        };
-
-        let savePageWorker = savePageLimiter.schedule(() => {
-          return this.#savePage(pageToSave);
-        });
-
-        pagesInProgress.push(savePageWorker);
       }
-      await Promise.all(pagesInProgress);
 
-      this.#runningMetadata.sectionHashes[sectionNumber] = sectionHash;
+      //Check if we already know which pages to check for changes
+      let startingPage = sectionNumber * pagesInSection;
+      let pagesChanged = new Set();
+
+      // Check each page for changes
+      for (
+        let pageNumber = startingPage;
+        pageNumber < startingPage + pagesInSection;
+        pageNumber++
+      ) {
+        pagesChanged.add(pageNumber);
+      }
+
+      this.#runningBackup.sectionHashes[sectionNumber] = sectionHash;
+
+      return {
+        sectionHash: sectionHash,
+        changedPages: pagesChanged,
+      };
     } catch (err) {
       console.error(err.message);
       throw err;
     }
   }
 
-  async #savePage(pageData) {
-    let existingHash =
-      this.#runningMetadata.pageLinks[pageData.index] || undefined;
-
-    // Write Page to IPFS
-    let contentToWrite = pageData.buffer;
-
-    let encryptedContent;
-    if (this.#configuration.encryptionEnabled === true) {
-      encryptedContent = this.encryptionHelper.encrypt(pageData.buffer);
-      contentToWrite = Buffer.from(encryptedContent.content);
-    }
-
-    // Return true immediately if values match
-    if (_.isObject(existingHash)) {
-      pageData.hash = await this.ipfsClient.add(
-        {
-          path: `${this.dbName}-${pageData.index}.page`,
-          content: contentToWrite,
-        },
-        {
-          cidVersion: 1,
-          onlyHash: true,
-        }
-      );
-      if (existingHash.toString() === pageData.hash.cid.toString()) {
-        return true;
-      } else {
-        console.log(`Page ${pageData.index + 1} has changed since last backup`);
-      }
-    }
-
-    let uploadedPage = await this.ipfsClient.add(
-      {
-        path: `${pageData.index}.page`,
-        content: contentToWrite,
-      },
-      {
-        cidVersion: 1,
-        pin: false,
-      }
-    );
-
-    this.#runningMetadata.pageLinks[pageData.index] = uploadedPage.cid;
-
-    console.log(
-      `Uploaded Page ${pageData.index + 1}/${this.dbStats.pageCount} (${(
-        (100 / this.dbStats.pageCount) *
-        (page.index + 1)
-      ).toFixed(2)}%) to IPFS at CID [${uploadedPage.cid.toString()}]`
-    );
-    return pageData;
-  }
-
   async #restorePage(pageNumber, link) {
     //Get Content
-    let contentToWrite = await this.ipfsClient.block.get(link.Hash);
-
-    //Check if Content is encrypted
-    if (this.#configuration.encryptionEnabled === true) {
-      contentToWrite = this.encryptionHelper.decrypt(contentToWrite);
-    }
+    let contentToWrite = await this.selectedAdapter.restorePage(
+      pageNumber,
+      link.Hash
+    );
 
     //Write Content to Disk
     await this.restoredDatabaseHandle.write(
@@ -693,7 +567,9 @@ async function sleep(ms) {
         }
 
         if (options.watch !== true) {
-          await db.restore(backupConfigurationCID);
+          await db.restoreDatabase({
+            backupStateCID: backupConfigurationCID,
+          });
 
           console.log(
             `Restore Completed from Config ${args.backupConfigurationDatabasePath}`
@@ -718,7 +594,10 @@ async function sleep(ms) {
               continue;
             }
 
-            await db.restore(currentCID, `replica.db`);
+            await db.restoreDatabase({
+              backupStateCID: currentCID,
+              restorePath: `replica.db`,
+            });
             runningCID = currentCID;
           }
 
@@ -766,7 +645,7 @@ async function sleep(ms) {
         if (options.watch === true) {
           console.log(`Watching for Changes`);
 
-          let writeAheadLogData = await db.trackLogChanges();
+          let writeAheadLogData = await db.watchPageChanges();
 
           let databaseFileWatcher = await fs.watch(
             path.dirname(db.dbFilePath),
@@ -792,7 +671,7 @@ async function sleep(ms) {
               databaseEvent.eventType === "change"
             ) {
               console.log(`WAL File Event: ${databaseEvent.eventType}`);
-              writeAheadLogData = await db.trackLogChanges();
+              writeAheadLogData = await db.watchPageChanges();
             }
           }
         }
