@@ -1,18 +1,22 @@
 const BaseAdapter = require("./baseAdapter");
 const _ = require("lodash");
 const IPFS = require("ipfs-http-client");
+const AWS = require("aws-sdk");
+const { v4: uuidv4 } = require("uuid");
 
-class IPFSAdapter extends BaseAdapter {
+class S3Adapter extends BaseAdapter {
   constructor(options) {
     super(options);
 
-    this.displayName = "IPFS";
+    this.displayName = "S3";
   }
 
   async connect(options) {
     try {
       // Wait for the IpfsAdapter Client to Initialize
-      this.adapterClient = await IPFS.create();
+      this.adapterClient = await IPFS.create(options.ipfs_config);
+      // Start S3 Client
+      this.adapterClient = new AWS.S3(options.s3_config);
     } catch (err) {
       console.error(err.message);
     }
@@ -27,6 +31,25 @@ class IPFSAdapter extends BaseAdapter {
   }
 
   async saveJSON(dataToSave) {
+    try {
+      // setup params for putObject
+      const params = {
+        Bucket: this.#adapterConfig.s3.bucket,
+        Key: `${uuidv4()}.json`,
+        Body: JSON.stringify(dataToSave),
+        ContentType: "application/json",
+      };
+      const result = await s3.putObject(params).promise();
+      console.log(
+        `File uploaded successfully at https://` +
+          this.#adapterConfig.s3.bucket +
+          `.s3.fbase.dev/` +
+          params.key
+      );
+    } catch (error) {
+      console.log("error");
+    }
+
     const dataCID = (
       await this.adapterClient.add(JSON.stringify(dataToSave), {
         cidVersion: 1,

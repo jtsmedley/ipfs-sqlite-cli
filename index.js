@@ -52,68 +52,95 @@ class IPFSSQLite {
     }
 
     this.selectedAdapter = new adapters.IPFS({
-      databaseName: `test.db`,
+      databaseName: `Northwind_small.sqlite`,
     });
 
     this.dbPageCIDs = [];
     this.restoreCount = 0;
   }
 
-  async restoreDatabase({ backupStateCID, restorePath }) {
-    console.log(`Connecting to IPFS`);
-
-    //Get existing configuration if passed
+  async restoreDatabase({ backupStateCID, restorePath, existingStateCID }) {
+    //Check if CID/S3 URL is passed
     if (_.isString(backupStateCID) === false) {
       throw new Error(`Invalid CID`);
     }
 
-    this.backupState = this.selectedAdapter.getMetadata(backupStateCID);
-    this.#runningBackup.sectionHashes = this.backupState.Hashes.Sections;
+    //Connect with Selected Adapter
+    console.log(
+      `Connecting to Selected Adapter: ${
+        this.selectedAdapter.displayName
+      } at Date: ${Date.now()}`
+    );
+    await this.selectedAdapter.connect({});
+    console.log(
+      `Connected to Selected Adapter: ${
+        this.selectedAdapter.displayName
+      } at Date: ${Date.now()}`
+    );
 
+    //Load Backup State
+    this.backupState = await this.selectedAdapter.getJSON(backupStateCID);
+
+    //Set Restore Path using name from backup state
     if (typeof restorePath === "undefined") {
       restorePath = `./restored-${this.backupState.Name}/${Date.now()}.db`;
     }
+
     //Ensure Restore File Exists
     await fse.ensureFile(restorePath);
     //Get Current DB Stats
     let restoreDatabaseStats = await fs.stat(restorePath);
-    //Check if Initial Restore
+    //Check if Existing Restore and if so Open and Lock the Database
     if (restoreDatabaseStats.size !== 0) {
-      //Open Database
       this.restoreDB = new Database(restorePath);
-      //Lock Database
       this.#lockDatabase(this.restoreDB, "EXCLUSIVE");
     }
     this.restoredDatabaseHandle = await fs.open(restorePath, "r+");
 
+    //Fetch New Backup Info
+    const backupInfo = await this.selectedAdapter.getJSON(
+      this.backupState.Versions.Current
+    );
+    //Fetch Existing Backup Info
+    const existingBackupInfo =
+      typeof existingStateCID === "string"
+        ? await this.selectedAdapter.getJSON(existingStateCID)
+        : null;
+
     //Parse through each Link and Download Pages
     let pageNumber = 0;
     let restoresInProgress = [];
+    //Reused variables
+    const totalPageCount = backupInfo.links.length;
     //Determine which sections can be skipped
-    for (let link of backupStateBlock.value.Links) {
+    for (const link of backupInfo.links) {
       //Check current CID for page and see if page has changed
       if (
-        typeof this.dbPageCIDs[pageNumber] === "string" &&
-        this.dbPageCIDs[pageNumber] === link.Hash.toString()
+        existingBackupInfo !== null &&
+        typeof existingBackupInfo.links[pageNumber] === "string" &&
+        existingBackupInfo.links[pageNumber] === link.Hash.toString()
       ) {
         pageNumber++;
         continue;
-      } else if (
-        typeof this.dbPageCIDs[pageNumber] === "string" &&
-        this.dbPageCIDs[pageNumber] !== link.Hash.toString()
-      ) {
-        console.log(`Updating Page: ${pageNumber + 1}`);
-      } else {
-        console.log(`Creating Page: ${pageNumber + 1}`);
       }
 
-      const pageToRestore = pageNumber;
+      let beforeActionVerb = `Creating`;
+      if (
+        existingBackupInfo !== null &&
+        typeof existingBackupInfo.links[pageNumber] === "string" &&
+        existingBackupInfo.links[pageNumber] !== link.Hash.toString()
+      ) {
+        beforeActionVerb = "Updating";
+      }
+      console.log(
+        `${beforeActionVerb} Page: (${pageNumber + 1}/${totalPageCount}) [${(
+          ((pageNumber + 1) / totalPageCount) *
+          100
+        ).toFixed(2)}%] from Page Link: ${link} at Date: ${Date.now()}`
+      );
 
       //Write Content to Disk
-      let contentToWrite = await this.selectedAdapter.restorePage(
-        pageToRestore,
-        link
-      );
+      let contentToWrite = await this.selectedAdapter.getPage(pageNumber, link);
       await this.restoredDatabaseHandle.write(
         contentToWrite,
         0,
@@ -121,30 +148,33 @@ class IPFSSQLite {
         pageNumber * contentToWrite.length
       );
 
-      //Set page CID
-      this.dbPageCIDs[pageNumber] = link.Hash.toString();
-
+      let actionVerb = `Created`;
+      if (
+        existingBackupInfo !== null &&
+        typeof existingBackupInfo.links[pageNumber] === "string" &&
+        existingBackupInfo.links[pageNumber] !== link.Hash.toString()
+      ) {
+        actionVerb = "Updated";
+      }
       console.log(
-        `Restored Page: (${pageToRestore + 1}/${
-          backupStateBlock.value.Links.length
-        }) [${(
-          ((pageToRestore + 1) / backupStateBlock.value.Links.length) *
+        `${actionVerb} Page: (${pageNumber + 1}/${totalPageCount}) [${(
+          ((pageNumber + 1) / totalPageCount) *
           100
-        ).toFixed(2)}%]`
+        ).toFixed(2)}%] from Link: ${link} at Date: ${Date.now()}`
       );
 
       //Next page
       pageNumber++;
     }
+
+    //Wait for all pages to be restored
     await Promise.all(restoresInProgress);
 
+    //If Database is a Fresh Restore then Open and Lock Database now
     if (restoreDatabaseStats.size === 0) {
-      //Open Database
       this.restoreDB = new Database(restorePath);
-      //Lock Database
       this.#lockDatabase(this.restoreDB, "EXCLUSIVE");
     }
-    this.restoreCount++;
 
     //Close File Handle
     await this.restoredDatabaseHandle.close();
@@ -156,8 +186,6 @@ class IPFSSQLite {
     //Unlock and Close Database
     await this.#unlockDatabase(this.restoreDB);
     await this.restoreDB.close();
-
-    console.log(`DB Restored`);
   }
 
   async backupDatabase({ dbFilePath, backupStateCID, pagesChanged }) {
@@ -174,7 +202,7 @@ class IPFSSQLite {
     //Get existing configuration if passed
     if (_.isString(backupStateCID)) {
       console.log(`Fetching Existing Backup State`);
-      this.backupState = await this.selectedAdapter.getMetadata(backupStateCID);
+      this.backupState = await this.selectedAdapter.getJSON(backupStateCID);
 
       //Load existing section hashes
       this.#runningBackup.sectionHashes = this.backupState.Hashes.Sections;
@@ -190,7 +218,6 @@ class IPFSSQLite {
     // Open Database in WAL mode
     console.log(`Opening Database File`);
     this.db = new Database(this.dbFilePath);
-    this.db.pragma("journal_mode = MEMORY");
     // Ensure Lock Table Exists
     this.#createLockTable(this.db);
     // Lock Database for Backup
@@ -281,13 +308,21 @@ class IPFSSQLite {
       let pagesInProgress = [];
       // Check each page for changes
       for (let pageNumber of pagesChangedInSection) {
+        let pageBuffer = sectionBuffer.subarray(
+          pageNumber * this.dbHeader["Page Size in Bytes"],
+          (pageNumber + 1) * this.dbHeader["Page Size in Bytes"]
+        );
+
+        //Set read and write mode to rollback journal instead of WAL
+        if (pageNumber === 0) {
+          pageBuffer[18] = 1;
+          pageBuffer[19] = 1;
+        }
+
         let savePageWorker = savePageLimiter.schedule(() => {
           return this.selectedAdapter.savePage(
             pageNumber,
-            sectionBuffer.subarray(
-              pageNumber * this.dbHeader["Page Size in Bytes"],
-              (pageNumber + 1) * this.dbHeader["Page Size in Bytes"]
-            ),
+            pageBuffer,
             this.#configuration.encryptionEnabled
           );
         });
@@ -314,19 +349,27 @@ class IPFSSQLite {
     // Close File Handle after Backup
     await this.dbFileHandle.close();
 
-    let backupCID = await this.selectedAdapter.saveBackup(
-      this.#runningBackup.pageLinks,
-      this.dbHeader["Page Size in Bytes"]
-    );
+    let backupCID = await this.selectedAdapter.saveJSON({
+      name: this.selectedAdapter.databaseName,
+      pageSize: this.dbHeader["Page Size in Bytes"],
+      links: this.#runningBackup.pageLinks,
+    });
 
-    let metadataResult = await this.selectedAdapter.saveMetadata(
-      fileHash,
-      this.#runningBackup.sectionHashes,
-      backupCID.toString()
-    );
+    let metadataResult = await this.selectedAdapter.saveJSON({
+      Name: this.selectedAdapter.databaseName,
+      CreatedOn: Date.now(),
+      Hashes: {
+        File: fileHash,
+        Sections: this.#runningBackup.sectionHashes,
+      },
+      Versions: {
+        Current: backupCID.toString(),
+        [Date.now()]: backupCID.toString(),
+      },
+    });
 
     let publishRequest = await this.selectedAdapter.publishMetadata(
-      `/ipfs/${metadataResult.Link}`
+      `/ipfs/${metadataResult}`
     );
     console.log(publishRequest.message);
   }
@@ -407,12 +450,12 @@ class IPFSSQLite {
     return {
       "Header String": headerBuffer.toString("utf8", 0, 16),
       "Page Size in Bytes": headerBuffer.readUIntBE(16, 2),
-      "File Format write Version": headerBuffer.at(18),
-      "File Format read Version": headerBuffer.at(19),
-      "Bytes Reserved at the end of Each Page": headerBuffer.at(20),
-      "Max Embedded Payload Fraction": headerBuffer.at(21),
-      "Min Embedded Payload Fraction": headerBuffer.at(22),
-      "Min Leaf Payload Fraction": headerBuffer.at(23),
+      "File Format write Version": headerBuffer[18],
+      "File Format read Version": headerBuffer[19],
+      "Bytes Reserved at the end of Each Page": headerBuffer[20],
+      "Max Embedded Payload Fraction": headerBuffer[21],
+      "Min Embedded Payload Fraction": headerBuffer[22],
+      "Min Leaf Payload Fraction": headerBuffer[23],
       "File Change Counter": headerBuffer.readUIntBE(24, 4),
       "Reserved for Future Use": headerBuffer.subarray(28, 32),
       "First Freelist Page": headerBuffer.readUIntBE(32, 4),
@@ -473,25 +516,6 @@ class IPFSSQLite {
     }
   }
 
-  async #restorePage(pageNumber, link) {
-    //Get Content
-    let contentToWrite = await this.selectedAdapter.restorePage(
-      pageNumber,
-      link.Hash
-    );
-
-    //Write Content to Disk
-    await this.restoredDatabaseHandle.write(
-      contentToWrite,
-      0,
-      contentToWrite.byteLength,
-      pageNumber * contentToWrite.length
-    );
-
-    //Set page CID
-    this.dbPageCIDs[pageNumber] = link.Hash.toString();
-  }
-
   #createLockTable(selectedDB = this.db) {
     try {
       selectedDB.prepare(`SELECT * FROM _ipfs_sqlite_seq WHERE id = @id`).get({
@@ -529,8 +553,7 @@ async function sleep(ms) {
 
 (async function () {
   program
-    .command("restore")
-    .option("--watch", "Watch IPNS for changes and run restore")
+    .command("replicate")
     .argument(
       "<backupConfigurationDatabasePath>",
       "Local Path to Backup Configuration Database"
@@ -547,8 +570,6 @@ async function sleep(ms) {
           customIV: args.customIv,
           customKey: args.customKey,
         });
-
-        db.ipfsClient = await db.IPFS.create();
 
         let protocol = args.backupConfigurationDatabasePath.split("/")[0];
 
@@ -603,6 +624,40 @@ async function sleep(ms) {
 
           await sleep(1000);
         }
+      } catch (err) {
+        console.error(err.message);
+        throw err;
+      }
+    });
+
+  program
+    .command("restore")
+    .argument("<backupStateCID>", "Local Path to Backup Configuration Database")
+    .argument("[customKey]", "Secret Key that Database was encrypted with")
+    .argument("[customIv]", "Secret IV that Database was encrypted with")
+    .action(async ({ logger, args, options }) => {
+      try {
+        console.log(
+          `Restore Started from Backup Metadata: ${
+            args.backupStateCid
+          } at Date: ${Date.now()}`
+        );
+
+        let db = new IPFSSQLite({
+          unencrypted: !args.customIv,
+          customIV: args.customIv,
+          customKey: args.customKey,
+        });
+
+        await db.restoreDatabase({
+          backupStateCID: args.backupStateCid,
+        });
+
+        console.log(
+          `Restore Completed from Backup Metadata: ${
+            args.backupStateCid
+          } at Date: ${Date.now()}`
+        );
       } catch (err) {
         console.error(err.message);
         throw err;

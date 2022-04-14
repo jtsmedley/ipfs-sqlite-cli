@@ -5,34 +5,31 @@ class BaseAdapter {
     }
 
     this.databaseName = options.databaseName;
-  }
-
-  async getMetadata() {
-    throw new Error(`Get metadata is not implemented.`);
-  }
-
-  async saveMetadata() {
-    throw new Error(`Save metadata is not implemented.`);
-  }
-
-  async publishMetadata() {
-    throw new Error(`Publish metadata is not implemented.`);
-  }
-
-  async saveBackup() {
-    throw new Error(`Save backup is not implemented.`);
+    this.encryptionHelper = options.encryptionHelper;
   }
 
   async connect() {
     throw new Error(`Connect is not implemented.`);
   }
 
-  async savePage(index, data) {
+  async getJSON() {
+    throw new Error(`Get JSON is not implemented.`);
+  }
+
+  async saveJSON() {
+    throw new Error(`Save JSON is not implemented.`);
+  }
+
+  async getPage() {
+    throw new Error("restorePage is not implemented");
+  }
+
+  async savePage() {
     throw new Error(`savePage is not implemented`);
   }
 
-  async restorePage(index) {
-    throw new Error("restorePage is not implemented");
+  async publishMetadata() {
+    throw new Error(`Publish metadata is not implemented.`);
   }
 }
 
